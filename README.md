@@ -16,21 +16,12 @@ Fine-tuning vision-language models (VLMs) such as CLIP often leads to catastroph
 
 ## Method Overview
 
-<p align="center">
-  <img src="assets/pipeline.png" width="100%" alt="Figure 2: The proposed MERGETUNE (conceptual illustration)">
-</p>
+![Figure 2: The proposed MERGETUNE (conceptual illustration)](assets/pipeline.png)
 
-<p align="center">
-  <em><strong>Figure 2: The proposed MERGETUNE (conceptual illustration).</strong></em><br>
-  (Left) Before MERGETUNE: The zero-shot model ŵ₁ and fine-tuned ŵ₂ exist in separate minima with no low-loss connectivity; linear interpolation reveals high barriers and a performance trade-off on base and novel classes. (Middle) During training: *w* is searched to be mode-connected to both ŵ₁ and ŵ₂, gradually integrating both models. (Right) After MERGETUNE: The continued model *w_ours* merges both endpoints for inference; the two low-loss paths ŵ₁ → *w_ours* and ŵ₂ → *w_ours* show smooth interpolation curves indicating stable performance.
-</p>
+**Figure 2: The proposed MERGETUNE (conceptual illustration).** (Left) Before MERGETUNE Training: The zero-shot model ŵ₁ and fine-tuned ŵ₂ exist in separate minima with no low-loss connectivity; linear interpolation reveals high barriers and a performance trade-off on base and novel classes. (Middle) During training: *w* is searched to be mode-connected to both ŵ₁ and ŵ₂, gradually integrating both models. (Right) After MERGETUNE Training: The continued model *w_ours* merges both endpoints for inference; the two low-loss paths ŵ₁ → *w_ours* and ŵ₂ → *w_ours* show smooth interpolation curves indicating stable performance.
 
 ---
 
-
----
-
----
 
 ## Setup
 
