@@ -2,7 +2,7 @@
 
 **[MergeTune: Continued Fine-Tuning of Vision-Language Models](https://arxiv.org/pdf/2601.10497)**
 
-**Wenqing Wang¹, Da Li²³\*, Xiatian Zhu¹†, Josef Kittler¹†**
+**Wenqing Wang¹\*, Da Li²³\*, Xiatian Zhu¹†, Josef Kittler¹†**
 
 ¹ University of Surrey · ² Samsung AI Centre Cambridge · ³ Queen Mary University of London
 
