@@ -28,7 +28,6 @@ import datasets.imagenet_r
 import trainers.coop
 import trainers.kgcoop
 import trainers.kgcoop_coop_LMC
-import trainers.promptkd
 import trainers.promptkd_LMC
 import trainers.mma
 import trainers.mma_LMC
@@ -109,7 +108,6 @@ def extend_cfg(cfg):
     cfg.TRAINER.COOP.NUM_SAMPLES = 5
     cfg.TRAINER.COOP.COOP_LMC = True
 
-
     cfg.TRAINER.COCOOP = CN()
     cfg.TRAINER.COCOOP.N_CTX = 16  # number of context vectors
     cfg.TRAINER.COCOOP.CTX_INIT = False  # initialization words
@@ -119,8 +117,36 @@ def extend_cfg(cfg):
     cfg.TRAINER.COOP_CLIP.N_CTX = 4
     cfg.TRAINER.COOP_CLIP.CTX_INIT = False
 
+    cfg.TRAINER.MMA = CN()
+    cfg.TRAINER.MMADAPTER.TEXT_CTX_INIT = ""  # initialization words
+    cfg.TRAINER.MMADAPTER.PREC = "amp"  # fp16, fp32, amp
+    # Put text prompt ctx before transformer 
+    cfg.TRAINER.MMADAPTER.ADAPTER_START = 4
+    cfg.TRAINER.MMADAPTER.ADAPTER_END = 12
+    cfg.TRAINER.MMADAPTER.ADAPTER_DIM = 32
+    cfg.TRAINER.MMADAPTER.ADAPTER_SCALE = 0.1
+
+    cfg.TRAINER.MODAL = "base2novel"
+    cfg.TRAINER.PROMPTKD = CN()
+    cfg.TRAINER.PROMPTKD.N_CTX_VISION = 4  # number of context vectors at the vision branch
+    cfg.TRAINER.PROMPTKD.N_CTX_TEXT = 4  # number of context vectors at the language branch
+    cfg.TRAINER.PROMPTKD.CTX_INIT = "a photo of a"  # initialization words
+    cfg.TRAINER.PROMPTKD.PREC = "fp16"  # fp16, fp32, amp
+    cfg.TRAINER.PROMPTKD.PROMPT_DEPTH_VISION = 9  # Max 12, minimum 0, for 0 it will be using shallow IVLP prompting (J=1)
+    cfg.TRAINER.PROMPTKD.PROMPT_DEPTH_TEXT = 9  # Max 12, minimum 0, for 0 it will be using shallow IVLP prompting (J=1)
+    cfg.TRAINER.PROMPTKD.PROJECT_LAYER = 2
+    cfg.TRAINER.PROMPTKD.CE_WEIGHT = 0.0
+    cfg.TRAINER.PROMPTKD.KD_WEIGHT= 1.0
+    cfg.TRAINER.PROMPTKD.TEMPERATURE = 1.0
+    cfg.TRAINER.PROMPTKD.TEACHER_NAME = "ViT-B/16"
+
+    cfg.TRAINER.SAM = CN()
+    cfg.TRAINER.SAM.RHO = 0.05  # SAM's rho parameter
+    cfg.TRAINER.SAM.ADAPTIVE = False  # Whether to use adaptive SAM
 
     cfg.DATASET.SUBSAMPLE_CLASSES = "all"  # all, base or new
+    cfg.DATASET.NUM_SHOTS = 16
+
     """
     Add new config
     """

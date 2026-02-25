@@ -299,8 +299,8 @@ class KgCoOp(TrainerX):
         prec = self.cfg.TRAINER.COOP.PREC
         if prec == "amp":
             with autocast():
-                output = self.model(image)
-                loss = F.cross_entropy(output, label)
+                output, score = self.model(image)
+                loss = F.cross_entropy(output, label) + self.w * score
             self.optim.zero_grad()
             self.scaler.scale(loss).backward()
             self.scaler.step(self.optim)

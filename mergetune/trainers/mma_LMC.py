@@ -300,14 +300,29 @@ class MMA_LMC(TrainerX):
 
         if self.cfg.RESUME_COOP and self.cfg.RESUME_COOP != 'None':
             print(f"Loading pretrained MMAdapter adapter_learner from {self.cfg.RESUME_COOP}")
-            # checkpoint_path = osp.join(self.cfg.RESUME_COOP, "adapter_learner/model.pth.tar-5")
-            checkpoint_path = osp.join(self.cfg.RESUME_COOP, "adapter_learner/model.pth.tar-1")
-
             
-            if osp.exists(checkpoint_path):
-                checkpoint_path = checkpoint_path
+            # Find the maximum epoch checkpoint
+            adapter_dir = osp.join(self.cfg.RESUME_COOP, "adapter_learner")
+            if osp.exists(adapter_dir):
+                import glob
+                checkpoint_files = glob.glob(osp.join(adapter_dir, "model.pth.tar-*"))
+                if checkpoint_files:
+                    # Extract epoch numbers and find maximum
+                    epochs = [int(f.split("-")[-1]) for f in checkpoint_files]
+                    max_epoch = max(epochs)
+                    checkpoint_path = osp.join(adapter_dir, f"model.pth.tar-{max_epoch}")
+                    print(f"Found checkpoint at epoch {max_epoch}: {checkpoint_path}")
+                else:
+                    # Try model-best.pth.tar as fallback
+                    checkpoint_path = osp.join(adapter_dir, "model-best.pth.tar")
+                    if not osp.exists(checkpoint_path):
+                        raise FileNotFoundError(f"No checkpoint files found in {adapter_dir}")
             else:
-                raise FileNotFoundError(f"Neither {checkpoint_path} exists")
+                raise FileNotFoundError(f"Adapter directory not found: {adapter_dir}")
+            
+            if not osp.exists(checkpoint_path):
+                raise FileNotFoundError(f"Checkpoint does not exist: {checkpoint_path}")
+            
             
             checkpoint = load_checkpoint(checkpoint_path)
             state_dict = checkpoint["state_dict"]

@@ -15,10 +15,11 @@ CTP=end  # class token position (end or middle)
 NCTX=4  # number of context tokens
 SHOTS=16  # number of shots (1, 2, 4, 8, 16)
 CSC=False  # class-specific context (False or True)
+NUM_SAMPLES=5
 
 for SEED in ${SEED}
 do
-    DIR=output_MMA_LMC/base2new/train_base/${DATASET}/shots_${SHOTS}/${TRAINER}/${CFG}/seed${SEED}
+    DIR=output_MMA_LMC/base2new/train_base/${DATASET}/shots_${SHOTS}_${W_LMC}/${TRAINER}/${CFG}/seed${SEED}
     RESUME=output_MMA/base2new/train_base/${DATASET}/shots_16/MultiModalAdapter/seed${SEED}
     
     if [ -d "$DIR" ]; then
@@ -41,6 +42,7 @@ do
         DATASET.NUM_SHOTS ${SHOTS} \
         TRAINER.COOP.W_LMC ${W_LMC} \
         TRAINER.COOP.COOP_LMC ${COOP_LMC} \
+        TRAINER.COOP.NUM_SAMPLES ${NUM_SAMPLES} \
         DATASET.SUBSAMPLE_CLASSES base
     fi
 done

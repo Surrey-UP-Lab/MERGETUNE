@@ -37,16 +37,8 @@ class Feature_Trans_Module_two_layer(nn.Module):
         
 def load_clip_to_cpu_teacher(cfg, zero_shot_model=False):
     backbone_name = cfg.TRAINER.PROMPTKD.TEACHER_NAME
-    # url = clip._MODELS[backbone_name]
-    
-    if backbone_name == "ViT-B/16":
-        model_path = './clip/ViT-B-16.pt'
-    elif backbone_name == "ViT-L/14":
-        model_path = './clip/ViT-L-14.pt'
-    elif backbone_name == "ViT-B/32":
-        model_path = './clip/ViT-B-32.pt'
-    else:
-        print('enter the wrong teacher name.')
+    url = clip._MODELS[backbone_name]
+    model_path = clip._download(url)
     
     print(f"CLIP Teacher name is {backbone_name}")
     
@@ -72,8 +64,8 @@ def load_clip_to_cpu_teacher(cfg, zero_shot_model=False):
 
 def load_clip_to_cpu(cfg, zero_shot_model=False):
     backbone_name = cfg.MODEL.BACKBONE.NAME
-    # url = clip._MODELS[backbone_name]
-    model_path = './clip/ViT-B-16.pt'
+    url = clip._MODELS[backbone_name]
+    model_path = clip._download(url)
     
     try:
         # loading JIT archive

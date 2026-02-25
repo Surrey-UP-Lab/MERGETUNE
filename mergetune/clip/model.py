@@ -199,6 +199,7 @@ class ResidualAttentionBlock(nn.Module):
     def __init__(self,
                  d_model: int,
                  n_head: int,
+                 layer_index: int = None,
                  attn_mask: torch.Tensor = None):
         super().__init__()
 
@@ -210,6 +211,7 @@ class ResidualAttentionBlock(nn.Module):
                          ("c_proj", nn.Linear(d_model * 4, d_model))]))
         self.ln_2 = LayerNorm(d_model)
         self.attn_mask = attn_mask
+        self.layer_index = layer_index
 
     def attention(self, x: torch.Tensor):
         self.attn_mask = self.attn_mask.to(
@@ -218,10 +220,31 @@ class ResidualAttentionBlock(nn.Module):
         return self.attn(x, x, x, need_weights=False,
                          attn_mask=self.attn_mask)[0]
 
-    def forward(self, x: torch.Tensor):
-        x = x + self.attention(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
-        return x
+    def forward(self, x):
+        if isinstance(x, list):
+            adapter_func = x[1]
+            x = x[0]
+            
+            seq_adapter, shared_adapter, scale = adapter_func(self.layer_index)
+            if seq_adapter is not None:
+                y = self.ln_1(x)
+                y = seq_adapter.down(y)
+                if shared_adapter is not None:
+                    y = shared_adapter(y)
+                y = seq_adapter.up(y) * scale
+            else:
+                y = 0
+            x = x + self.attention(self.ln_1(x))
+            x = x + self.mlp(self.ln_2(x)) + y
+        else:
+            adapter_func = None
+            x = x + self.attention(self.ln_1(x))
+            x = x + self.mlp(self.ln_2(x))
+
+        if adapter_func is None:
+            return x
+        else:
+            return [x, adapter_func]
 
 
 class Transformer(nn.Module):
@@ -234,12 +257,16 @@ class Transformer(nn.Module):
         self.width = width
         self.layers = layers
         self.resblocks = nn.Sequential(*[
-            ResidualAttentionBlock(width, heads, attn_mask)
-            for _ in range(layers)
+            ResidualAttentionBlock(width, heads, index + 1, attn_mask)
+            for index in range(layers)
         ])
 
     def forward(self, x: torch.Tensor):
-        return self.resblocks(x)
+        y = self.resblocks(x)
+        if isinstance(y, list):
+            return y[0]
+        else:
+            return y
 
 
 class VisionTransformer(nn.Module):
@@ -266,6 +293,13 @@ class VisionTransformer(nn.Module):
         self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
 
     def forward(self, x: torch.Tensor):
+        # Handle adapter case: if x is a list [tensor, adapter_func]
+        if isinstance(x, list):
+            adapter_func = x[1]
+            x = x[0]
+        else:
+            adapter_func = None
+        
         x = self.conv1(x)  # shape = [*, width, grid, grid]
         x = x.reshape(x.shape[0], x.shape[1],
                       -1)  # shape = [*, width, grid ** 2]
@@ -276,10 +310,26 @@ class VisionTransformer(nn.Module):
         ],
                       dim=1)  # shape = [*, grid ** 2 + 1, width]
         x = x + self.positional_embedding.to(x.dtype)
-        x = self.ln_pre(x)
+        
+        if adapter_func is not None:
+            seq_adapter, shared_adapter, scale = adapter_func(0)
+            if seq_adapter is not None:
+                y = self.ln_pre(x)
+                y = seq_adapter.down(y)
+                if shared_adapter is not None:
+                    y = shared_adapter(y)
+                y = seq_adapter.up(y) * scale
+            else:
+                y = 0
+            x = self.ln_pre(x) + y
+        else:
+            x = self.ln_pre(x)
 
         x = x.permute(1, 0, 2)  # NLD -> LND
-        x = self.transformer(x)
+        if adapter_func is not None:
+            x = self.transformer([x, adapter_func])
+        else:
+            x = self.transformer(x)
         x = x.permute(1, 0, 2)  # LND -> NLD
 
         x = self.ln_post(x[:, 0, :])

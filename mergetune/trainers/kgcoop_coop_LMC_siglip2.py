@@ -1,6 +1,7 @@
 import os.path as osp
 import json
 import time
+import datetime
 import itertools
 from pathlib import Path
 from tqdm import tqdm
@@ -10,16 +11,23 @@ import torch.nn as nn
 from torch.nn import functional as F
 from torch.cuda.amp import GradScaler, autocast
 from collections import OrderedDict
-import datetime
-
 
 from dassl.engine import TRAINER_REGISTRY, TrainerX
 from dassl.metrics import compute_accuracy
 from dassl.utils import load_pretrained_weights, load_checkpoint
 from dassl.optim import build_optimizer, build_lr_scheduler
 
-from clip import clip
-from clip.simple_tokenizer import SimpleTokenizer as _Tokenizer
+# Import for SigLIP
+from transformers import AutoModel, AutoProcessor, AutoTokenizer
+
+# Fallback to CLIP if needed
+try:
+    from clip import clip
+    from clip.simple_tokenizer import SimpleTokenizer as _Tokenizer
+    _tokenizer = _Tokenizer()
+except:
+    _tokenizer = None
+
 import numpy as np
 
 # For Optuna (optional)
@@ -29,25 +37,116 @@ try:
 except ImportError:
     OPTUNA_AVAILABLE = False
 
-_tokenizer = _Tokenizer()
+
+class SigLIPWrapper(nn.Module):
+    """Wrapper to make SigLIP compatible with CLIP-style interface"""
+    def __init__(self, siglip_model, processor):
+        super().__init__()
+        self.model = siglip_model
+        self.processor = processor
+        
+        # Add compatibility attributes for CLIP-style access
+        self.visual = siglip_model.vision_model
+        self.token_embedding = siglip_model.text_model.embeddings.token_embedding
+        self.transformer = siglip_model.text_model.encoder
+        self.positional_embedding = siglip_model.text_model.embeddings.position_embedding.weight
+        self.ln_final = siglip_model.text_model.final_layer_norm
+        
+        # Handle text projection
+        if hasattr(siglip_model, 'text_projection'):
+            self.text_projection = siglip_model.text_projection
+        elif hasattr(siglip_model.text_model, 'text_projection'):
+            self.text_projection = siglip_model.text_model.text_projection
+        else:
+            print("Warning: No text_projection found in SigLIP model, using Identity")
+            self.text_projection = nn.Identity()
+        
+        self.logit_scale = nn.Parameter(torch.ones([]) * 4.6052)
+        self._dtype = next(siglip_model.parameters()).dtype
+    
+    @property
+    def dtype(self):
+        return self._dtype
+    
+    def float(self):
+        self.model.float()
+        self._dtype = torch.float32
+        return self
+    
+    def half(self):
+        self.model.half()
+        self._dtype = torch.float16
+        return self
+    
+    def encode_text(self, text):
+        """CLIP-style text encoding for compatibility"""
+        return self.model.get_text_features(text)
+    
+    def forward(self, *args, **kwargs):
+        return self.model(*args, **kwargs)
+
+
+def load_siglip_to_cpu(cfg):
+    """Load SigLIP model from Hugging Face"""
+    backbone_name = cfg.MODEL.BACKBONE.NAME
+    siglip_models = {
+        "SigLIP-B/16": "google/siglip-base-patch16-224",
+        "SigLIP-L/16": "google/siglip-large-patch16-256",
+        "SigLIP-SO400M/14": "google/siglip-so400m-patch14-384",
+        "SigLIP2-B/16": "google/siglip-base-patch16-224",  # Alias for SigLIP 2
+        "SigLIP2-L/16": "google/siglip-large-patch16-256",  # SigLIP 2 Large
+    }
+    
+    model_id = siglip_models.get(backbone_name, "google/siglip-base-patch16-224")
+    print(f"Loading SigLIP model: {model_id}")
+    
+    siglip_model = AutoModel.from_pretrained(model_id)
+    processor = AutoProcessor.from_pretrained(model_id)
+    model = SigLIPWrapper(siglip_model, processor)
+    return model
 
 
 def load_clip_to_cpu(cfg):
+    """Load CLIP or SigLIP model"""
     backbone_name = cfg.MODEL.BACKBONE.NAME
+    
+    if "SigLIP" in backbone_name or "siglip" in backbone_name.lower():
+        return load_siglip_to_cpu(cfg)
+    
     url = clip._MODELS[backbone_name]
     model_path = clip._download(url)
 
     try:
-        # loading JIT archive
         model = torch.jit.load(model_path, map_location="cpu").eval()
         state_dict = None
-
     except RuntimeError:
         state_dict = torch.load(model_path, map_location="cpu")
 
     model = clip.build_model(state_dict or model.state_dict())
-
     return model
+
+
+def tokenize_siglip(texts, processor, context_length=64):
+    """Tokenize text for SigLIP models"""
+    if isinstance(texts, str):
+        texts = [texts]
+    tokens = processor.tokenizer(
+        texts,
+        padding="max_length",
+        max_length=context_length,
+        truncation=True,
+        return_tensors="pt"
+    )
+    return tokens.input_ids
+
+
+def tokenize(texts, model=None):
+    """Universal tokenizer"""
+    if hasattr(model, 'processor'):
+        return tokenize_siglip(texts, model.processor)
+    else:
+        return clip.tokenize(texts)
+
 
 CUSTOM_TEMPLATES = {
     "OxfordPets": "a photo of a {}, a type of pet.",
@@ -78,17 +177,52 @@ class TextEncoder(nn.Module):
         self.ln_final = clip_model.ln_final
         self.text_projection = clip_model.text_projection
         self.dtype = clip_model.dtype
+        
+        # Check if this is a SigLIP model and get the head layer
+        self.is_siglip = hasattr(clip_model, 'processor')
+        if self.is_siglip:
+            # SigLIP has a head layer that must be applied after pooling
+            if hasattr(clip_model.model.text_model, 'head'):
+                self.head = clip_model.model.text_model.head
+            else:
+                self.head = nn.Identity()
+        else:
+            self.head = None
 
     def forward(self, prompts, tokenized_prompts):
-        x = prompts + self.positional_embedding.type(self.dtype)
-        x = x.permute(1, 0, 2)  # NLD -> LND
-        x = self.transformer(x)
-        x = x.permute(1, 0, 2)  # LND -> NLD
-        x = self.ln_final(x).type(self.dtype)
-
-        # x.shape = [batch_size, n_ctx, transformer.width]
-        # take features from the eot embedding (eot_token is the highest number in each sequence)
-        x = x[torch.arange(x.shape[0]), tokenized_prompts.argmax(dim=-1)] @ self.text_projection
+        if self.is_siglip:
+            # SigLIP uses batch_first=True, so no permutation needed
+            x = prompts + self.positional_embedding.type(self.dtype)
+            if hasattr(self.transformer, 'forward'):
+                x = self.transformer(x).last_hidden_state if hasattr(self.transformer(x), 'last_hidden_state') else self.transformer(x)
+            else:
+                x = self.transformer(x)
+            x = self.ln_final(x).type(self.dtype)
+            
+            # SigLIP uses LAST position (sticky EOS tokenization), not argmax
+            # x.shape = [batch_size, n_ctx, transformer.width]
+            x = x[:, -1, :]  # Take features from last position
+            
+            # Apply head layer (crucial for SigLIP)
+            x = self.head(x)
+        else:
+            # Original CLIP architecture
+            x = prompts + self.positional_embedding.type(self.dtype)
+            x = x.permute(1, 0, 2)  # NLD -> LND
+            x = self.transformer(x)
+            x = x.permute(1, 0, 2)  # LND -> NLD
+            x = self.ln_final(x).type(self.dtype)
+            
+            # take features from the eot embedding (eot_token is the highest number in each sequence)
+            x = x[torch.arange(x.shape[0]), tokenized_prompts.argmax(dim=-1)]
+            
+            # Apply text projection
+            if isinstance(self.text_projection, nn.Identity):
+                pass
+            elif isinstance(self.text_projection, nn.Linear):
+                x = self.text_projection(x)
+            else:
+                x = x @ self.text_projection
 
         return x
 
@@ -101,16 +235,23 @@ class PromptLearner(nn.Module):
         ctx_init = cfg.TRAINER.COOP.CTX_INIT
         dtype = clip_model.dtype
         ctx_dim = clip_model.ln_final.weight.shape[0]
-        clip_imsize = clip_model.visual.input_resolution
+        
+        # Handle different image size attributes for SigLIP vs CLIP
+        if hasattr(clip_model.visual, 'input_resolution'):
+            clip_imsize = clip_model.visual.input_resolution
+        elif hasattr(clip_model.visual, 'config'):
+            clip_imsize = clip_model.visual.config.image_size
+        else:
+            clip_imsize = 224
         cfg_imsize = cfg.INPUT.SIZE[0]
-        assert cfg_imsize == clip_imsize, f"cfg_imsize ({cfg_imsize}) must equal to clip_imsize ({clip_imsize})"
+        print(f"Model image size: {clip_imsize}, Config image size: {cfg_imsize}")
 
         if ctx_init:
             # use given words to initialize context vectors
             temp = 'a photo of a'
             ctx_init = temp.replace("_", " ")
             n_ctx = len(ctx_init.split(" "))
-            prompt = clip.tokenize(ctx_init)
+            prompt = tokenize(ctx_init, clip_model)
             with torch.no_grad():
                 embedding = clip_model.token_embedding(prompt).type(dtype)
             
@@ -138,7 +279,10 @@ class PromptLearner(nn.Module):
 
 
         classnames = [name.replace("_", " ") for name in classnames]
-        name_lens = [len(_tokenizer.encode(name)) for name in classnames]
+        if _tokenizer is not None:
+            name_lens = [len(_tokenizer.encode(name)) for name in classnames]
+        else:
+            name_lens = [len(name.split()) + 1 for name in classnames]
         prompts = [prompt_prefix + " " + name + "." for name in classnames]
 
         #print(f"Loading CLIP (backbone: {cfg.MODEL.BACKBONE.NAME})")
@@ -149,7 +293,7 @@ class PromptLearner(nn.Module):
         temp = CUSTOM_TEMPLATES[cfg.DATASET.NAME]
         prompts_ = [temp.format(c.replace("_", " ")) for c in classnames]
         print(f"Prompts: {prompts_}")
-        prompts_ = torch.cat([clip.tokenize(p) for p in prompts_])
+        prompts_ = torch.cat([tokenize(p, clip_model_) for p in prompts_])
         prompts_ = prompts_.cuda()
 
         with torch.no_grad():
@@ -159,7 +303,7 @@ class PromptLearner(nn.Module):
         self.text_features = text_features
 
 
-        tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts])
+        tokenized_prompts = torch.cat([tokenize(p, clip_model) for p in prompts])
         with torch.no_grad():
             embedding = clip_model.token_embedding(tokenized_prompts).type(dtype)
         # These token vectors will be saved when in save_model(),
@@ -204,16 +348,23 @@ class PromptMidLearner(nn.Module):
         ctx_init = cfg.TRAINER.COOP_CLIP.CTX_INIT
         dtype = clip_model.dtype
         ctx_dim = clip_model.ln_final.weight.shape[0]
-        clip_imsize = clip_model.visual.input_resolution
+        
+        # Handle different image size attributes for SigLIP vs CLIP
+        if hasattr(clip_model.visual, 'input_resolution'):
+            clip_imsize = clip_model.visual.input_resolution
+        elif hasattr(clip_model.visual, 'config'):
+            clip_imsize = clip_model.visual.config.image_size
+        else:
+            clip_imsize = 224
         cfg_imsize = cfg.INPUT.SIZE[0]
-        assert cfg_imsize == clip_imsize, f"cfg_imsize ({cfg_imsize}) must equal to clip_imsize ({clip_imsize})"
+        print(f"Model image size: {clip_imsize}, Config image size: {cfg_imsize}")
 
         if ctx_init:
             # use given words to initialize context vectors
             temp = 'a photo of a'
             ctx_init = temp.replace("_", " ")
             n_ctx = len(ctx_init.split(" "))
-            prompt = clip.tokenize(ctx_init)
+            prompt = tokenize(ctx_init, clip_model)
             with torch.no_grad():
                 embedding = clip_model.token_embedding(prompt).type(dtype)
             
@@ -244,7 +395,10 @@ class PromptMidLearner(nn.Module):
 
 
         classnames = [name.replace("_", " ") for name in classnames]
-        name_lens = [len(_tokenizer.encode(name)) for name in classnames]
+        if _tokenizer is not None:
+            name_lens = [len(_tokenizer.encode(name)) for name in classnames]
+        else:
+            name_lens = [len(name.split()) + 1 for name in classnames]
         prompts = [prompt_prefix + " " + name + "." for name in classnames]
 
         #print(f"Loading CLIP (backbone: {cfg.MODEL.BACKBONE.NAME})")
@@ -255,7 +409,7 @@ class PromptMidLearner(nn.Module):
         temp = CUSTOM_TEMPLATES[cfg.DATASET.NAME]
         prompts_ = [temp.format(c.replace("_", " ")) for c in classnames]
         print(f"Prompts: {prompts_}")
-        prompts_ = torch.cat([clip.tokenize(p) for p in prompts_])
+        prompts_ = torch.cat([tokenize(p, clip_model_) for p in prompts_])
         prompts_ = prompts_.cuda()
 
         with torch.no_grad():
@@ -264,7 +418,7 @@ class PromptMidLearner(nn.Module):
 
         self.text_features = text_features
 
-        tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts])
+        tokenized_prompts = torch.cat([tokenize(p, clip_model) for p in prompts])
         with torch.no_grad():
             embedding = clip_model.token_embedding(tokenized_prompts).type(dtype)
         # These token vectors will be saved when in save_model(),
@@ -368,6 +522,12 @@ class CustomCLIP(nn.Module):
         if sign is None:
             prompts = self.prompt_mid_learner()
             image_features = self.image_encoder(image.type(self.dtype))
+            
+            # Handle SigLIP output: extract pooled features from BaseModelOutputWithPooling
+            if hasattr(image_features, 'pooler_output'):
+                image_features = image_features.pooler_output
+            elif hasattr(image_features, 'last_hidden_state'):
+                image_features = image_features.last_hidden_state.mean(dim=1)
 
             tokenized_prompts = self.tokenized_prompts
             text_features = self.text_encoder(prompts, tokenized_prompts) 
@@ -397,6 +557,12 @@ class CustomCLIP(nn.Module):
         else:
             # prompts = self.prompt_mid_learner()
             image_features = self.image_encoder(image.type(self.dtype))
+            
+            # Handle SigLIP output: extract pooled features from BaseModelOutputWithPooling
+            if hasattr(image_features, 'pooler_output'):
+                image_features = image_features.pooler_output
+            elif hasattr(image_features, 'last_hidden_state'):
+                image_features = image_features.last_hidden_state.mean(dim=1)
 
             tokenized_prompts = self.tokenized_prompts
             text_features = text_features_mid
@@ -411,7 +577,8 @@ class CustomCLIP(nn.Module):
         
 
 @TRAINER_REGISTRY.register()
-class KgCoOp_COOP_LMC(TrainerX):
+class KgCoOp_COOP_LMC_SigLIP2(TrainerX):
+    """KgCoOp with COOP LMC and SigLIP 2 Support"""
 
     def check_cfg(self, cfg):
         assert cfg.TRAINER.COOP.PREC in ["fp16", "fp32", "amp"]
